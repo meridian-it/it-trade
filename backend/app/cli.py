@@ -31,13 +31,15 @@ async def _sync(name: str) -> None:
 
 
 async def _process(n: int) -> None:
+    from app.images.processing import ProcessedImage
+    from app.site_settings import ImageSettings
     from app.supplier.client import SupplierClient
     from app.sync.images import next_pending, process_one
 
     async with SupplierClient() as client:
-        batch = await next_pending(n, include_out_of_stock=True)
+        batch = await next_pending(n, ImageSettings(), include_out_of_stock=True)
         ok = await asyncio.gather(*(process_one(client, None, iid, url) for iid, url in batch), return_exceptions=True)
-        print(f"{sum(r is True for r in ok)}/{len(ok)} processed")
+        print(f"{sum(isinstance(r, ProcessedImage) for r in ok)}/{len(ok)} processed")
 
 
 async def _probe(sku: int) -> None:
