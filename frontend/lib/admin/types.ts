@@ -317,6 +317,9 @@ export type Loading = {
     outdated: boolean; // started before the backend code changed: restart it
     image_workers: number | null;
     cpus: number | null;
+    photo_at: string | null; // the last photo it processed
+    problem: { text: string; at: string } | null; // a trouble it ran into within the last hour
+    pool_restarts: number; // times its photo processes were replaced (one died or hung)
   };
   overview: {
     products: number;
@@ -326,6 +329,7 @@ export type Loading = {
     photos_total: number;
     photos_estimated: boolean;
     eta_seconds: number | null;
+    stalled_since: string | null; // the worker takes photos but none got processed since then
   };
   speed: { photos_per_second: number | null; source: "measured" | "expected"; last_10_min: number };
   checks: LoadingCheck[];

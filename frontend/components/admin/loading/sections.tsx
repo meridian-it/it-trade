@@ -183,10 +183,12 @@ function StageRow({ stage: st, n }: { stage: LoadingStage; n: number }) {
       {st.error && (
         <p className="mt-1 text-sm break-words text-destructive">
           {st.error}
-          <span className="text-muted-foreground">
-            {" · "}
-            {st.retry_requested ? "повтор в течение 30 секунд" : st.retry_at ? `повтор ${retryWhen(st.retry_at)}` : "повтор скоро"}
-          </span>
+          {st.retry_at !== undefined && ( // a supplier sync: it runs again by itself
+            <span className="text-muted-foreground">
+              {" · "}
+              {st.retry_requested ? "повтор в течение 30 секунд" : st.retry_at ? `повтор ${retryWhen(st.retry_at)}` : "повтор скоро"}
+            </span>
+          )}
         </p>
       )}
     </CardLine>
