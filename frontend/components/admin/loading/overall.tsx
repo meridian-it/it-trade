@@ -53,6 +53,7 @@ export function OverallPanel({ data }: { data: Loading }) {
   const parts = buildParts(stages, o);
   const photosPct = o.photos_total ? (100 * o.photos_done) / o.photos_total : 0;
   const allDone = parts.every((p) => p.status === "done" || p.status === "off");
+  const stalled = o.stalled_since != null && !allDone;
 
   return (
     <section className="@container rounded-2xl bg-background p-5 ring-1 ring-foreground/10 sm:p-6">
@@ -78,21 +79,28 @@ export function OverallPanel({ data }: { data: Loading }) {
         />
         <Big
           label="Осталось"
-          value={allDone ? "Всё готово" : o.eta_seconds != null ? `≈ ${duration(o.eta_seconds)}` : "—"}
+          value={allDone ? "Всё готово" : stalled ? "Загрузка стоит" : o.eta_seconds != null ? `≈ ${duration(o.eta_seconds)}` : "—"}
+          tone={stalled ? "text-destructive" : undefined}
           hint={
-            settings.paused && !allDone
-              ? "загрузка фото на паузе: время — после запуска"
-              : speed.photos_per_second
-                ? `при ${speed.photos_per_second.toLocaleString("ru-RU")} фото/с${speed.source === "measured" ? "" : ", ожидаемой"}`
-                : undefined
+            stalled
+              ? `фото не обрабатываются ${duration(secondsSince(o.stalled_since!))}`
+              : settings.paused && !allDone
+                ? "загрузка фото на паузе: время — после запуска"
+                : speed.photos_per_second
+                  ? `при ${speed.photos_per_second.toLocaleString("ru-RU")} фото/с${speed.source === "measured" ? "" : ", ожидаемой"}`
+                  : undefined
           }
         />
         <div className="text-sm sm:text-right">
-          <p className={cn("font-medium", worker.alive ? "text-emerald-700" : "text-destructive")}>
-            {worker.alive ? "Воркер работает" : "Воркер не отвечает"}
+          <p className={cn("font-medium", worker.alive && !stalled ? "text-emerald-700" : "text-destructive")}>
+            {!worker.alive ? "Воркер не отвечает" : stalled ? "Фото не грузятся" : "Воркер работает"}
           </p>
           <p className="text-muted-foreground">
-            {worker.alive ? (ACTIVITY[worker.activity ?? ""] ?? "") : "сигнала нет больше 1,5 минут"}
+            {!worker.alive
+              ? "сигнала нет больше 1,5 минут"
+              : stalled
+                ? "причина — в блоке «Готовность»"
+                : (ACTIVITY[worker.activity ?? ""] ?? "")}
           </p>
         </div>
       </div>
@@ -212,18 +220,29 @@ function countedPart(st: LoadingStage | undefined, title: string, weight: number
     share: status === "done" ? 1 : total ? Math.min(1, done / total) : 0,
     status,
     note: status === "off" ? "выключено" : `${formatNumber(done)} из ${st?.estimated ? "≈" : ""}${formatNumber(total)}`,
-    sub: status === "paused" ? `на паузе${eta ? `, после запуска ${eta}` : ""}` : status === "waiting" && eta ? `закончится через ${eta}` : eta,
+    sub:
+      status === "error" && st?.error
+        ? st.error
+        : status === "paused"
+          ? `на паузе${eta ? `, после запуска ${eta}` : ""}`
+          : status === "waiting" && eta
+            ? `закончится через ${eta}`
+            : eta,
   };
 }
 
-function Big({ label, value, hint }: { label: string; value: React.ReactNode; hint?: string }) {
+function Big({ label, value, hint, tone }: { label: string; value: React.ReactNode; hint?: string; tone?: string }) {
   return (
     <div className="min-w-0">
       <p className="text-sm text-muted-foreground">{label}</p>
-      <p className="mt-0.5 text-3xl font-semibold tracking-tight tabular-nums">{value}</p>
+      <p className={cn("mt-0.5 text-3xl font-semibold tracking-tight tabular-nums", tone)}>{value}</p>
       {hint && <p className="mt-0.5 text-sm text-muted-foreground">{hint}</p>}
     </div>
   );
+}
+
+function secondsSince(iso: string): number {
+  return Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
 }
 
 function pct(p: number): string {
