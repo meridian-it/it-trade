@@ -3,7 +3,8 @@
 import asyncio
 import logging
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
+from collections.abc import Collection
+from concurrent.futures.process import BrokenProcessPool
 from datetime import timedelta
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.db import SessionLocal
 from app.images.gallery import copies, thumbnail
+from app.images.pool import ImagePool
 from app.images.processing import VERSION, ProcessedImage, delete_image_files, image_path, process_image
 from app.models import Product, ProductImage
 from app.models.base import utcnow
@@ -26,6 +28,10 @@ log = logging.getLogger(__name__)
 LIST_BATCH = 100
 REFRESH_AFTER = timedelta(days=14)
 MAX_ATTEMPTS = 3
+# Kinds of ProductImage.error the worker writes itself ("network: image 1/2.jpg: ReadTimeout"), named
+# on the admin page: the supplier did not send the file while it sent others; the processing of the
+# photo killed its process (the kernel stops a process that takes too much memory) or hung.
+NETWORK, CRASHED, HUNG = "network", "crashed", "hung"
 
 
 async def _skus_needing_lists(limit: int) -> list[int]:
@@ -124,8 +130,11 @@ async def replace_failed_main(session, sku: int) -> None:
     )
 
 
-async def next_pending(limit: int, cfg: ImageSettings, *, include_out_of_stock: bool = False) -> list[tuple[int, str]]:
-    """What the worker processes next, of in-stock products (then of out-of-stock ones if requested):
+async def next_pending(
+    limit: int, cfg: ImageSettings, *, include_out_of_stock: bool = False, exclude: Collection[int] = ()
+) -> list[tuple[int, str]]:
+    """What the worker processes next (but the photos in `exclude`), of in-stock products (then of
+    out-of-stock ones if requested):
     1. photos never processed: all main photos first, then all second photos, the third ones... up to
        `cfg.per_product` (only the main ones unless `cfg.gallery`: the others then on the first view);
     2. photos queued for processing again (stale), in the same order;
@@ -139,6 +148,8 @@ async def next_pending(limit: int, cfg: ImageSettings, *, include_out_of_stock: 
         old = or_(ProductImage.algo_version.is_(None), ProductImage.algo_version < VERSION)
         steps.append(and_(ProductImage.status == ImageStatus.ready, old))
     shown = ProductImage.position < (cfg.per_product if cfg.gallery else 1)
+    if exclude:
+        shown = and_(shown, ProductImage.id.not_in(list(exclude)))
     rows: list = []
     async with SessionLocal() as session:
         for in_stock in (True, False) if include_out_of_stock else (True,):
@@ -173,35 +184,26 @@ async def pick_trial(n: int) -> list[tuple[int, str]]:
     return [tuple(r) for r in rows]
 
 
-async def process_one(
-    client: SupplierClient, pool: ProcessPoolExecutor | None, image_id: int, url: str
-) -> ProcessedImage | None:
-    """Downloads, cleans and stores one photo; None if that failed. Raises SupplierUnavailable on
-    network trouble (the image stays queued and its attempts are not used up)."""
+async def process_one(client: SupplierClient, pool: ImagePool | None, image_id: int, url: str) -> ProcessedImage | None:
+    """Downloads, cleans and stores one photo; None if that failed: an attempt of the photo is used up
+    (record_failure), whatever the cause, so a photo that cannot be processed does not stay first in the
+    queue. Raises SupplierUnavailable on network trouble and BrokenProcessPool when the worker's processes
+    broke: whether the photo is to blame is not known yet, the caller decides (app.worker.process_batch)."""
     s = get_settings()
     try:
         data = await client.fetch_image(url, size="original")
         if pool is None:
             res = await asyncio.to_thread(process_image, data, str(s.media_root), image_id)
         else:
-            res = await asyncio.get_running_loop().run_in_executor(pool, process_image, data, str(s.media_root), image_id)
-    except SupplierUnavailable:
+            res = await pool.run(process_image, data, str(s.media_root), image_id)
+    except (SupplierUnavailable, BrokenProcessPool):
         raise
-    except (SupplierError, OSError, ValueError) as e:
-        log.warning("image %s (%s) failed: %s", image_id, url, e)
-        async with SessionLocal() as session:
-            img = await session.get(ProductImage, image_id)
-            if img:
-                img.attempts = MAX_ATTEMPTS if isinstance(e, SupplierNotFound) else img.attempts + 1
-                img.error = str(e)[:500]
-                if img.attempts >= MAX_ATTEMPTS:
-                    if img.status in VISIBLE_STATUSES:
-                        img.status = ImageStatus.ready  # processed before: its files stay on the site
-                    else:
-                        img.status = ImageStatus.failed
-                        await session.flush()
-                        await replace_failed_main(session, img.sku)
-                await session.commit()
+    except Exception as e:  # noqa: BLE001 - recorded on the photo; a bug in the processing is logged in full
+        if isinstance(e, (SupplierError, OSError, ValueError)):
+            log.warning("image %s (%s) failed: %s", image_id, url, e)
+        else:
+            log.exception("image %s (%s): processing crashed", image_id, url)
+        await record_failure(image_id, e)
         return None
     async with SessionLocal() as session:
         await session.execute(
@@ -228,6 +230,31 @@ async def process_one(
             await refresh_copies(session, sku)
         await session.commit()
     return res
+
+
+async def record_failure(image_id: int, error: BaseException | str) -> None:
+    """Uses up an attempt of the photo (all of them when the supplier has no such file). After MAX_ATTEMPTS
+    the photo leaves the queue: failed, or ready if it was processed before (its files stay on the site)."""
+    if isinstance(error, (SupplierError, OSError, ValueError)):
+        text = str(error)
+    elif isinstance(error, BaseException):
+        text = f"{type(error).__name__}: {error}"
+    else:
+        text = error
+    async with SessionLocal() as session:
+        img = await session.get(ProductImage, image_id)
+        if img is None:
+            return
+        img.attempts = MAX_ATTEMPTS if isinstance(error, SupplierNotFound) else img.attempts + 1
+        img.error = text[:500]
+        if img.attempts >= MAX_ATTEMPTS:
+            if img.status in VISIBLE_STATUSES:
+                img.status = ImageStatus.ready
+            else:
+                img.status = ImageStatus.failed
+                await session.flush()
+                await replace_failed_main(session, img.sku)
+        await session.commit()
 
 
 async def refresh_copies(session: AsyncSession, sku: int) -> int:

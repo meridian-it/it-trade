@@ -5,26 +5,28 @@
 
 import asyncio
 import logging
+import math
 import os
 import signal
 import statistics
 import time
 import traceback
-from collections.abc import Awaitable, Callable
-from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Collection
+from concurrent.futures.process import BrokenProcessPool
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from app.config import get_settings
 from app.db import SessionLocal
+from app.images.pool import ImagePool
 from app.images.processing import ProcessedImage
 from app.models import JobState
 from app.models.base import utcnow
 from app.site_settings import ImageSettings, SyncSettings, get_settings_obj
 from app.supplier.client import SupplierClient, SupplierUnavailable
 from app.sync.categories import sync_categories
-from app.sync.images import next_pending, pick_trial, process_one, sync_image_lists
+from app.sync.images import CRASHED, HUNG, NETWORK, next_pending, pick_trial, process_one, record_failure, sync_image_lists
 from app.sync.products import sync_products
 from app.sync.stock import sync_stock
 from app.version import code_fingerprint
@@ -39,6 +41,12 @@ IDLE_WAIT = 10  # seconds between looks at the settings and the trial while ther
 # An empty queue is looked at again after this long (~1 s of database work on the whole catalog), or
 # at once after a supplier sync or a change of the settings: those are what bring new work.
 EMPTY_QUEUE_WAIT = 60
+BATCH = 60  # photos taken from the queue at a time
+STALL_AFTER = 300  # seconds without any photo of a batch finished: a photo process hangs
+POSTPONE = 600  # seconds a photo the supplier did not send waits before it is taken again
+SUPPLIER_SEEN = 600  # the supplier sent a photo this recently: one it does not send is that file's problem
+CRASHES_IN_A_ROW = 3  # photos that kill their process one after another: blame the server (memory), not them
+CRASH_PAUSE = 300  # seconds the photos wait then
 
 
 LISTS_EVERY = timedelta(minutes=2)
@@ -165,8 +173,39 @@ async def _sleep(stop: asyncio.Event, seconds: float) -> None:
         pass
 
 
-async def image_loop(client: SupplierClient, pool: ProcessPoolExecutor, stop: asyncio.Event, state: dict) -> None:
+@dataclass
+class PhotoQueue:
+    """What the photo loop remembers between batches."""
+
+    postponed: dict[int, float] = field(default_factory=dict)  # photo id -> monotonic time it may be taken again
+    supplier_seen: float = -math.inf  # monotonic time the supplier last sent a photo
+
+    def postpone(self, image_id: int) -> None:
+        self.postponed[image_id] = time.monotonic() + POSTPONE
+
+    def excluded(self) -> list[int]:
+        now = time.monotonic()
+        self.postponed = {iid: t for iid, t in self.postponed.items() if t > now}
+        return list(self.postponed)
+
+
+@dataclass
+class BatchResult:
+    processed: int = 0
+    failed: int = 0  # an attempt of the photo used up (it leaves the queue after MAX_ATTEMPTS)
+    unsent: int = 0  # not sent by the supplier (network trouble): put aside for POSTPONE
+    left: int = 0  # not tried to the end: the photo processes keep crashing
+    problem: tuple[str, str] | None = None  # (kind, detail) for the admin panel (app.api.admin.loading.PROBLEMS)
+
+    @property
+    def answered(self) -> bool:
+        """The supplier sent at least one of the photos."""
+        return bool(self.processed or self.failed)
+
+
+async def image_loop(client: SupplierClient, pool: ImagePool, stop: asyncio.Event, state: dict) -> None:
     s = get_settings()
+    queue = PhotoQueue()
     last_cfg, next_look = None, 0.0  # when to look at the queue again
     while not stop.is_set():
         async with SessionLocal() as session:
@@ -179,26 +218,138 @@ async def image_loop(client: SupplierClient, pool: ProcessPoolExecutor, stop: as
             continue
         batch = []
         if not cfg.paused and time.monotonic() >= next_look:
-            batch = await next_pending(60, cfg, include_out_of_stock=s.image_prefetch_out_of_stock)
+            batch = await next_pending(BATCH, cfg, include_out_of_stock=s.image_prefetch_out_of_stock, exclude=queue.excluded())
             if not batch:
                 next_look = time.monotonic() + EMPTY_QUEUE_WAIT
         state["activity"] = "photos" if batch else "paused" if cfg.paused else "idle"
         if not batch:
             await _sleep(stop, IDLE_WAIT)
             continue
-        # downloads are paced by the client's rate limiter, CPU work goes to the pool
-        results = await asyncio.gather(*(process_one(client, pool, iid, url) for iid, url in batch), return_exceptions=True)
-        done = sum(isinstance(r, ProcessedImage) for r in results)
-        unavailable = sum(isinstance(r, SupplierUnavailable) for r in results)
-        for r in results:
-            if isinstance(r, BaseException) and not isinstance(r, SupplierUnavailable):
-                log.error("image processing crashed", exc_info=r)
-        log.info("images: %d processed, %d failed, %d postponed (supplier unreachable)", done, len(results) - done - unavailable, unavailable)
-        if unavailable:
+        res = await process_batch(client, pool, batch, queue, stop)
+        log.info("images: %d processed, %d failed, %d not sent by the supplier", res.processed, res.failed, res.unsent)
+        if res.processed:
+            state["photo_at"] = utcnow().isoformat()
+        if res.problem:
+            kind, detail = res.problem
+            state["problem"] = {"kind": kind, "detail": detail[:300], "at": utcnow().isoformat()}
+        state["pool_restarts"] = pool.restarts
+        if res.left:
+            await _sleep(stop, CRASH_PAUSE)
+        elif res.unsent and not res.answered:
             await _sleep(stop, 60)  # give the supplier a break
 
 
-async def run_trial(client: SupplierClient, pool: ProcessPoolExecutor, state: dict) -> bool:
+async def process_batch(
+    client: SupplierClient, pool: ImagePool, batch: list[tuple[int, str]], queue: PhotoQueue, stop: asyncio.Event | None = None
+) -> BatchResult:
+    """Processes the photos together (downloads paced by the client's rate limiter, CPU work in the pool)
+    and sees that no photo can stop the queue, which takes the same first photos again until they leave it:
+    - a process that hangs (no photo finished for STALL_AFTER) is killed with the others of the pool;
+    - the photos that were in a pool that broke (a process died: the kernel kills one that takes too much
+      memory) or was killed are processed again one at a time, so the one that breaks the pool on its own
+      uses up an attempt and the others are not blamed;
+    - a photo the supplier does not send is put aside for POSTPONE, and uses up an attempt if the supplier
+      sends other photos meanwhile (the trouble is with that file, not the network)."""
+    res = BatchResult()
+    urls = dict(batch)
+    tasks = {asyncio.ensure_future(process_one(client, pool, iid, url)): iid for iid, url in batch}
+    if await _wait_watched(tasks, pool):
+        res.problem = ("hung", "")
+    broken: list[int] = []
+    unavailable: dict[int, str] = {}
+    for task, iid in tasks.items():
+        if task.cancelled():
+            unavailable[iid] = f"image {urls[iid]}: NoAnswer"  # cancelled by _wait_watched
+        elif (e := task.exception()) is None:
+            if task.result() is None:
+                res.failed += 1
+            else:
+                res.processed += 1
+        elif isinstance(e, SupplierUnavailable):
+            unavailable[iid] = str(e)
+        elif isinstance(e, BrokenProcessPool):
+            broken.append(iid)
+        else:  # failed after the processing, saving it: tried again, at most MAX_ATTEMPTS times
+            log.error("image %s: crashed", iid, exc_info=e)
+            await record_failure(iid, e)
+            res.failed += 1
+            res.problem = res.problem or ("error", f"{type(e).__name__}: {e}")
+    if broken:
+        res.problem = res.problem or ("pool_broken", "")
+        log.error("images: the photo processes broke, %d photos are processed again one at a time", len(broken))
+    crashes = 0
+    for k, iid in enumerate(broken):
+        if crashes >= CRASHES_IN_A_ROW or (stop is not None and stop.is_set()):
+            res.left = len(broken) - k  # still queued, not blamed
+            if crashes >= CRASHES_IN_A_ROW:
+                res.problem = ("crashes", str(crashes))
+            break
+        try:
+            r = await asyncio.wait_for(process_one(client, pool, iid, urls[iid]), STALL_AFTER)
+        except SupplierUnavailable as e:
+            unavailable[iid] = str(e)
+            continue
+        except BrokenProcessPool:  # broke a fresh pool on its own (replaced already)
+            log.error("image %s (%s) kills the photo process", iid, urls[iid])
+            await record_failure(iid, f"{CRASHED}: image {urls[iid]}")
+            res.failed += 1
+            crashes += 1
+            continue
+        except TimeoutError:
+            log.error("image %s (%s) hangs the photo process", iid, urls[iid])
+            pool.restart()
+            await record_failure(iid, f"{HUNG}: image {urls[iid]}")
+            res.failed += 1
+            crashes += 1
+            continue
+        except Exception as e:  # noqa: BLE001 - as above: saving it failed
+            log.error("image %s: crashed", iid, exc_info=e)
+            await record_failure(iid, e)
+            res.failed += 1
+            continue
+        crashes = 0
+        if r is None:
+            res.failed += 1
+        else:
+            res.processed += 1
+
+    now = time.monotonic()
+    if res.answered:
+        queue.supplier_seen = now
+    files_to_blame = now - queue.supplier_seen < SUPPLIER_SEEN
+    for iid, error in unavailable.items():
+        queue.postpone(iid)
+        if files_to_blame:
+            await record_failure(iid, f"{NETWORK}: {error}")
+    res.unsent = len(unavailable)
+    if unavailable and not res.answered:
+        res.problem = res.problem or ("supplier", next(iter(unavailable.values())))
+    return res
+
+
+async def _wait_watched(tasks: Collection[asyncio.Future], pool: ImagePool) -> bool:
+    """Waits for the tasks. When none of them finishes for STALL_AFTER, a photo process hangs: the pool is
+    restarted (the photos in it fail with BrokenProcessPool); when still none finishes, the rest hang in
+    their downloads and are cancelled. Returns whether the pool was restarted."""
+    pending, restarted = set(tasks), False
+    while pending:
+        done, pending = await asyncio.wait(pending, timeout=STALL_AFTER, return_when=asyncio.FIRST_COMPLETED)
+        if done:
+            continue
+        if not restarted:
+            log.error("images: none of %d photos finished in %d s, restarting the photo processes", len(pending), STALL_AFTER)
+            pool.restart()
+            restarted = True
+            continue
+        log.error("images: %d photo downloads hang, cancelled", len(pending))
+        for t in pending:
+            t.cancel()
+        await asyncio.wait(pending)
+        break
+    return restarted
+
+
+async def run_trial(client: SupplierClient, pool: ImagePool | None, state: dict) -> bool:
     """Processes the trial batch asked for in the admin panel, if there is one: random main photos of
     in-stock products, with the speed and the CPU time measured. Returns whether there was one."""
     async with SessionLocal() as session:
@@ -290,7 +441,7 @@ async def main() -> None:
     async with SupplierClient(s) as client:
         if not client.has_credentials:
             log.warning("SUPPLIER_LOGIN/SUPPLIER_PASSWORD are empty: price/stock/image syncs will fail")
-        with ProcessPoolExecutor(max_workers=s.image_workers) as pool:
+        with ImagePool(s.image_workers) as pool:
             state: dict = {"activity": "starting"}
             await asyncio.gather(scheduler(client, stop, state), image_loop(client, pool, stop, state), heartbeat(stop, state))
 

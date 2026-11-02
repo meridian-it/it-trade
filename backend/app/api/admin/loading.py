@@ -31,9 +31,9 @@ from app.models.base import utcnow
 from app.models.catalog import VISIBLE_STATUSES, ImageStatus
 from app.site_settings import SITE_RPS_MIN, ImageSettings, ShopSettings, SyncSettings, get_settings_obj
 from app.supplier.client import IMAGE_RPS_LIMIT
-from app.sync.images import LIST_BATCH
+from app.sync.images import CRASHED, HUNG, LIST_BATCH, NETWORK
 from app.version import code_fingerprint
-from app.worker import HEARTBEAT_EVERY, RETRY, RETRY_AFTER, TRIAL, WORKER, scheduled_at
+from app.worker import CRASH_PAUSE, CRASHES_IN_A_ROW, HEARTBEAT_EVERY, RETRY, RETRY_AFTER, STALL_AFTER, TRIAL, WORKER, scheduled_at
 from app.worker import jobs as worker_jobs
 
 router = APIRouter()
@@ -43,6 +43,20 @@ LEFT_VISIBLE = 10.0  # mark left (luma levels per unit of alpha) above which the
 PHOTO_BYTES = 55_000  # both sizes of a photo, until enough photos are processed to measure it
 SPEED_WINDOW = timedelta(minutes=10)  # the processing speed is measured over (at most) this time
 SPEED_IDLE = timedelta(minutes=1)  # nothing processed for this long: the speed is not measured
+# The worker takes photos, but none got processed for this long: the loading stands, and the page says so
+# instead of an estimate at the expected speed
+STALL_SHOWN = timedelta(minutes=10)
+PROBLEM_SHOWN = timedelta(hours=1)  # a trouble the worker ran into is shown this long
+# What the worker ran into (app.worker.process_batch), the detail it gave is put at {}
+PROBLEMS = {
+    "pool_broken": "Процесс обработки фото упал (обычно ядро останавливает процесс, которому не хватило памяти); "
+    "воркер запустил новые и обработал фото той партии по одному",
+    "hung": f"Обработка фото зависла: за {STALL_AFTER // 60} мин ни одно фото не обработалось; воркер перезапустил обработку",
+    "crashes": f"{CRASHES_IN_A_ROW} фото подряд уронили процесс обработки: похоже, серверу не хватает памяти. "
+    f"Фото ждут {CRASH_PAUSE // 60} мин и пробуются снова",
+    "supplier": "Поставщик не отдаёт фото ({}); воркер откладывает их и пробует другие",
+    "error": "Ошибка при сохранении фото: {}",
+}
 SYNC_JOBS = {"categories": "Категории", "products": "Каталог товаров", "stock": "Цены и наличие", "image_lists": "Списки фото"}
 PHASES = {"download": "скачивание файла каталога", "import": "запись товаров в базу"}
 
@@ -142,6 +156,7 @@ async def loading(session: Session) -> dict[str, Any]:
     jobs = {j.name: j for j in (await session.scalars(select(JobState))).all()}
     worker = _worker(jobs.get(WORKER), now)
     trial = await _trial(session, jobs.get(TRIAL))
+    stalled_since = await _stalled_since(session, worker, now)
     c = await catalog_counts(session, cfg.per_product)
 
     lists_left = max(0, c["stock_photos"] - c["lists_done"])
@@ -179,7 +194,7 @@ async def loading(session: Session) -> dict[str, Any]:
     redo_left = redo if cfg.reprocess else 0
 
     def eta(*parts: int) -> float | None:
-        return sum(parts) / speed if speed else None
+        return sum(parts) / speed if speed and not stalled_since else None
 
     photos_running = worker["alive"] and not cfg.paused
     lists = _sync_stage("image_lists", jobs, "какие фото у каких товаров в наличии, по 100 товаров за запрос")
@@ -235,6 +250,10 @@ async def loading(session: Session) -> dict[str, Any]:
         },
     ]
 
+    if stalled_since:  # the photo stage the worker is at stands
+        for st in stages[4:]:
+            if st["status"] == "running":
+                st["status"], st["error"] = "error", f"фото не обрабатываются {_ago(stalled_since, suffix='')}"
     left_bytes = (main_left + gallery_left) * await _photo_bytes(session)
     return {
         "generated_at": now,
@@ -259,13 +278,14 @@ async def loading(session: Session) -> dict[str, Any]:
             "photos_total": main_total + (gallery_total if cfg.gallery else 0),
             "photos_estimated": lists_left > 0,
             "eta_seconds": eta(main_left, gallery_left) if main_left or gallery_left else None,
+            "stalled_since": stalled_since,
         },
         "speed": {
             "photos_per_second": speed,
             "source": speed_source,
             "last_10_min": recent,
         },
-        "checks": await _checks(session, jobs, worker, trial, cfg, left_bytes, c["without_price"]),
+        "checks": await _checks(session, jobs, worker, trial, cfg, left_bytes, c["without_price"], stalled_since),
         "stages": stages,
         "trial": trial,
         "quality": c["quality"],
@@ -375,6 +395,8 @@ def _sync_stage(key: str, jobs: dict[str, JobState], detail: str) -> dict[str, A
 def _worker(st: JobState | None, now: datetime) -> dict[str, Any]:
     info = st.info if st else {}
     beat = datetime.fromisoformat(info["heartbeat"]) if info.get("heartbeat") else None
+    problem = info.get("problem")
+    problem_at = datetime.fromisoformat(problem["at"]) if problem else None
     return {
         "alive": beat is not None and now - beat <= timedelta(seconds=3 * HEARTBEAT_EVERY),
         "heartbeat": beat,
@@ -384,7 +406,34 @@ def _worker(st: JobState | None, now: datetime) -> dict[str, Any]:
         "outdated": info.get("code") != code_fingerprint(),
         "image_workers": info.get("image_workers"),
         "cpus": info.get("cpus"),
+        # the last photo it processed (since its start; a worker of an older code does not tell)
+        "photo_at": datetime.fromisoformat(info["photo_at"]) if info.get("photo_at") else None,
+        "problem": (
+            {"text": _problem_text(problem), "at": problem_at}
+            if problem and problem_at and now - problem_at <= PROBLEM_SHOWN
+            else None
+        ),
+        "pool_restarts": info.get("pool_restarts") or 0,
     }
+
+
+def _problem_text(problem: dict[str, str]) -> str:
+    text = PROBLEMS.get(problem.get("kind", ""), "{}")
+    detail = _error_text(problem.get("detail") or "")
+    if problem.get("kind") == "supplier":  # "image product_images/1/2.jpg: ConnectTimeout" -> "ConnectTimeout"
+        detail = detail.rsplit(": ", 1)[-1]
+    return text.format(detail) if "{}" in text else text
+
+
+async def _stalled_since(session, worker: dict[str, Any], now: datetime) -> datetime | None:
+    """Since when the worker takes photos but processes none (None: it does, or it does not take any)."""
+    if not (worker["alive"] and worker["activity"] == "photos"):
+        return None
+    since = worker["photo_at"]
+    if since is None:  # none since its start, or a worker of an older code: by the photos in the database
+        last = await session.scalar(select(func.max(ProductImage.processed_at)))
+        since = max((t for t in (last, worker["started_at"]) if t is not None), default=None)
+    return since if since is not None and now - since > STALL_SHOWN else None
 
 
 async def _trial(session, st: JobState | None) -> dict[str, Any] | None:
@@ -411,7 +460,9 @@ async def _trial(session, st: JobState | None) -> dict[str, Any] | None:
     return out
 
 
-async def _checks(session, jobs, worker, trial, cfg: ImageSettings, left_bytes: int, without_price: int) -> list[dict[str, Any]]:
+async def _checks(
+    session, jobs, worker, trial, cfg: ImageSettings, left_bytes: int, without_price: int, stalled_since: datetime | None = None
+) -> list[dict[str, Any]]:
     s = get_settings()
     checks = []
 
@@ -460,7 +511,28 @@ async def _checks(session, jobs, worker, trial, cfg: ImageSettings, left_bytes: 
             "Перезапустите воркер: docker compose restart worker (в разработке dev.sh перезапускает его сам)",
         )
     else:
-        add("worker", "Воркер", "ok", f"Работает {_ago(worker['started_at'], suffix='')}; процессов обработки фото: {worker['image_workers']}")
+        restarts = worker["pool_restarts"]
+        add(
+            "worker",
+            "Воркер",
+            "ok",
+            f"Работает {_ago(worker['started_at'], suffix='')}; процессов обработки фото: {worker['image_workers']}"
+            + (f", заменялись упавшие или зависшие: {restarts} раз" if restarts else ""),
+        )
+
+    # the photo queue: stands, or the worker ran into trouble lately (and got over it)
+    problem = worker.get("problem")
+    if stalled_since:
+        add(
+            "photos",
+            "Загрузка фото",
+            "error",
+            f"Фото не обрабатываются {_ago(stalled_since, suffix='')}" + (f". {problem['text']}" if problem else ""),
+            "Воркер справляется с этим сам: перезапускает обработку, откладывает фото, которые не скачиваются или роняют "
+            "обработку. Если не проходит: docker compose restart worker, а что случилось — в docker compose logs --tail 300 worker",
+        )
+    elif problem:
+        add("photos", "Загрузка фото", "warn", f"{_ago(problem['at']).capitalize()}: {problem['text']}")
 
     # processing speed vs downloads, from the trial batch
     if trial and trial.get("capacity"):
@@ -571,6 +643,23 @@ async def _photo_bytes(session) -> int:
 
 _HTTP = re.compile(r"HTTP (\d{3})")
 REASONS = {"404": "У поставщика нет файла (HTTP 404)", "403": "Поставщик не дал скачать (HTTP 403)"}
+KIND_REASONS = {
+    CRASHED: "Обработка роняет процесс: файл слишком большой или битый",
+    HUNG: f"Обработка зависает (дольше {STALL_AFTER // 60} мин)",
+}
+
+
+def _reason(error: str | None) -> str:
+    """Why a photo failed, in a few words: photos are grouped by it on the page."""
+    e = error or "без описания"
+    if m := _HTTP.search(e):
+        return REASONS.get(m.group(1), f"Поставщик ответил HTTP {m.group(1)}")
+    kind, _, detail = e.partition(": ")
+    if kind in KIND_REASONS:
+        return KIND_REASONS[kind]
+    if kind == NETWORK:  # "network: image product_images/1/2.jpg: ReadTimeout"
+        return f"Поставщик не отдаёт файл ({detail.rsplit(': ', 1)[-1]})"
+    return re.sub(r"\d+", "N", e.split(": ", 1)[-1])[:120]
 
 
 async def _failed(session) -> dict[str, Any]:
@@ -578,13 +667,7 @@ async def _failed(session) -> dict[str, Any]:
     errors = (
         await session.scalars(select(ProductImage.error).where(ProductImage.status == ImageStatus.failed).limit(5000))
     ).all()
-    reasons: Counter[str] = Counter()
-    for e in errors:
-        m = _HTTP.search(e or "")
-        if m:
-            reasons[REASONS.get(m.group(1), f"Поставщик ответил HTTP {m.group(1)}")] += 1
-        else:
-            reasons[re.sub(r"\d+", "N", (e or "без описания").split(": ", 1)[-1])[:120]] += 1
+    reasons = Counter(_reason(e) for e in errors)
     return {"total": total, "reasons": [{"reason": k, "count": n} for k, n in reasons.most_common(6)]}
 
 
